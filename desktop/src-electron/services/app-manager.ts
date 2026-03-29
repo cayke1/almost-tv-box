@@ -66,63 +66,29 @@ export class AppManager {
 
   sendKeyToActiveView(key: string, type: 'keyDown' | 'keyUp' | 'keyDownUp' = 'keyDown'): void {
     const activeId = this.activeViewId;
-    console.log(`[AppManager] sendKeyToActiveView called, activeViewId: ${activeId}, type: ${type}`);
-
-    if (!activeId) {
-      console.log('[AppManager] No active view, skipping key send');
-      return;
-    }
+    if (!activeId) return;
 
     const instance = this.views.get(activeId);
-    if (!instance) {
-      console.log('[AppManager] No instance found for:', activeId);
-      return;
-    }
+    if (!instance) return;
 
     console.log(`[AppManager] Sending key to ${activeId}: ${key}`);
 
-    const keyCodeMap: Record<string, number> = {
-      'ArrowUp': 38,
-      'ArrowDown': 40,
-      'ArrowLeft': 37,
-      'ArrowRight': 39,
-      'Enter': 13,
-      'Escape': 27,
-      ' ': 32,
-    };
+    if (type === 'keyDown' || type === 'keyDownUp') {
+      instance.view.webContents.sendInputEvent({
+        type: 'keyDown',
+        keyCode: key,
+      });
+    }
 
-    const keyCode = keyCodeMap[key] || key.charCodeAt(0);
-    const jsCode = keyCodeMap[key] || 0;
-
-    const js = `
-      (function() {
-        const event = new KeyboardEvent('keydown', {
-          key: '${key}',
-          code: '${key}',
-          keyCode: ${jsCode},
-          which: ${jsCode},
-          bubbles: true,
-          cancelable: true
+    if (type === 'keyUp' || type === 'keyDownUp') {
+      setTimeout(() => {
+        instance.view.webContents.sendInputEvent({
+          type: 'keyUp',
+          keyCode: key,
         });
-        document.dispatchEvent(event);
-        
-        setTimeout(() => {
-          const eventUp = new KeyboardEvent('keyup', {
-            key: '${key}',
-            code: '${key}',
-            keyCode: ${jsCode},
-            which: ${jsCode},
-            bubbles: true,
-            cancelable: true
-          });
-          document.dispatchEvent(eventUp);
-        }, 50);
-      })();
-    `;
+      }, 50);
+    }
 
-    instance.view.webContents.executeJavaScript(js).catch(() => {});
-    
-    this.mainWindow.setBrowserView(instance.view);
     instance.view.webContents.focus();
   }
 
@@ -157,7 +123,7 @@ export class AppManager {
 
     // Check for external app
     if (appConfig.externalPath) {
-      const execPath = appConfig.externalPath === 'auto' 
+      let execPath = appConfig.externalPath === 'auto' 
         ? findExecutable(STREMIO_PATHS)
         : appConfig.externalPath;
       
@@ -231,15 +197,6 @@ export class AppManager {
     view.setAutoResize({ width: true, height: true });
 
     const useNativeKeyboard = needsNativeKeyboard(appId);
-
-    view.webContents.on('before-input-event', (_event, input) => {
-      if (input.type === 'keyDown' && input.key === 'Escape') {
-        console.log('[AppManager] ESC pressed in BrowserView, closing...');
-        this.closeAllViews().then(() => {
-          this.mainWindow.webContents.send('app-closed');
-        });
-      }
-    });
 
     view.webContents.on('did-start-loading', () => {
       this.mainWindow.webContents.send('app:loading-change', { isLoading: true });

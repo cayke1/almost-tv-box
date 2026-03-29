@@ -2,28 +2,27 @@ import dotenv from 'dotenv';
 import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
-import { WebSocket } from 'ws';
+import { EventEmitter } from 'events';
+import Bonjour from 'bonjour-service';
+
+const bonjour = new Bonjour();
 
 dotenv.config();
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const ELECTRON_HOST = process.env.ELECTRON_HOST || '127.0.0.1';
-const ELECTRON_WS_PORT = parseInt(process.env.ELECTRON_WS_PORT || '8081', 10);
+const TV_POLL_TIMEOUT_MS = 10000; // TV considered disconnected after 10s without poll
+const LONG_POLL_TIMEOUT_MS = 30000; // Max time to hold a poll request
 
 interface ClientMessage {
   type: string;
   payload: Record<string, unknown>;
+  clientId?: string;
+  timestamp?: number;
 }
 
-let electronWs: WebSocket | null = null;
-let reconnectAttempts = 0;
-let reconnectTimeout: NodeJS.Timeout | null = null;
-let pingInterval: NodeJS.Timeout | null = null;
-const maxReconnectAttempts = 10;
-const baseReconnectDelay = 1000;
-
-const messageQueue: Array<{ type: string; payload: Record<string, unknown> }> = [];
+const messageQueue: Array<ClientMessage> = [];
 const clientLastPoll: Map<string, number> = new Map();
+const messageEmitter = new EventEmitter();
 
 const app = express();
 app.use(cors());
@@ -31,102 +30,23 @@ app.use(express.json());
 
 const server = createServer(app);
 
-function getReconnectDelay(): number {
-  const delay = Math.min(baseReconnectDelay * Math.pow(2, reconnectAttempts), 30000);
-  return delay;
-}
-
-function connectToElectron(): void {
-  if (reconnectTimeout) {
-    clearTimeout(reconnectTimeout);
-    reconnectTimeout = null;
-  }
-
-  if (reconnectAttempts >= maxReconnectAttempts) {
-    console.log('[Server] Max reconnect attempts reached, stopping...');
-    return;
-  }
-
-  const wsUrl = `ws://${ELECTRON_HOST}:${ELECTRON_WS_PORT}`;
-  console.log(`[Server] Connecting to Electron at ${wsUrl} (attempt ${reconnectAttempts + 1})`);
-
-  try {
-    electronWs = new WebSocket(wsUrl);
-
-    electronWs.on('open', () => {
-      console.log('[Server] Connected to Electron');
-      reconnectAttempts = 0;
-      broadcastToMobile({ type: 'CONNECTION_STATUS', payload: { electronConnected: true } });
-      startPing();
-    });
-
-    electronWs.on('message', (data: Buffer) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === 'PONG') {
-          return;
-        }
-        broadcastToMobile(msg);
-      } catch (error) {
-        console.error('[Server] Failed to parse message:', error);
-      }
-    });
-
-    electronWs.on('close', () => {
-      console.log('[Server] Disconnected from Electron');
-      stopPing();
-      broadcastToMobile({ type: 'CONNECTION_STATUS', payload: { electronConnected: false } });
-      
-      if (reconnectAttempts < maxReconnectAttempts) {
-        const delay = getReconnectDelay();
-        console.log(`[Server] Reconnecting in ${delay}ms...`);
-        reconnectTimeout = setTimeout(() => {
-          reconnectAttempts++;
-          connectToElectron();
-        }, delay);
-      }
-    });
-
-    electronWs.on('error', (error) => {
-      console.error('[Server] Electron connection error:', error.message);
-    });
-  } catch (error) {
-    console.error('[Server] Failed to create WebSocket:', error);
-  }
-}
-
-function startPing(): void {
-  stopPing();
-  pingInterval = setInterval(() => {
-    if (electronWs && electronWs.readyState === WebSocket.OPEN) {
-      electronWs.send(JSON.stringify({ type: 'PING', payload: {} }));
-    }
-  }, 15000);
-}
-
-function stopPing(): void {
-  if (pingInterval) {
-    clearInterval(pingInterval);
-    pingInterval = null;
-  }
-}
-
-function broadcastToMobile(msg: { type: string; payload: Record<string, unknown> }): void {
+function addToQueue(msg: ClientMessage): void {
+  msg.timestamp = Date.now();
   messageQueue.push(msg);
-  const maxQueueSize = 50;
-  while (messageQueue.length > maxQueueSize) {
+  
+  // Keep queue size manageable
+  const maxQueueSize = 100;
+  if (messageQueue.length > maxQueueSize) {
     messageQueue.shift();
   }
+  
+  // Signal that a new message is available
+  messageEmitter.emit('new_message');
 }
 
-function handleMobileMessage(clientId: string, msg: ClientMessage): void {
-  clientLastPoll.set(clientId, Date.now());
-
-  if (electronWs && electronWs.readyState === WebSocket.OPEN) {
-    electronWs.send(JSON.stringify({ ...msg, clientId }));
-  } else {
-    messageQueue.push({ type: 'ERROR', payload: { message: 'TV not connected' } });
-  }
+function handleMobileMessage(clientId: string, msg: { type: string; payload: Record<string, unknown> }): void {
+  console.log(`[Server] Received command from ${clientId}: ${msg.type}`);
+  addToQueue({ ...msg, clientId });
 }
 
 function getMobileUI(): string {
@@ -166,32 +86,31 @@ function getMobileUI(): string {
   </div>
   <div id="info">TV: <span id="tvInfo">-</span></div>
   <script>
-    var clientIdCounterGlobal = 0;
-    const clientId = 'mobile_' + (++clientIdCounterGlobal);
+    const clientId = 'mobile_' + Math.random().toString(36).substr(2, 9);
     const status = document.getElementById('tvInfo');
     const statusEl = document.getElementById('status');
     let lastMsgIndex = 0;
-    let electronConnected = false;
 
     async function poll() {
       try {
         const res = await fetch('/api/poll?clientId=' + clientId + '&index=' + lastMsgIndex);
         const data = await res.json();
-        electronConnected = data.electronConnected;
-        if (data.messages) {
+        
+        statusEl.textContent = data.electronConnected ? 'TV Connected' : 'TV Offline';
+        statusEl.classList.toggle('disconnected', !data.electronConnected);
+
+        if (data.messages && data.messages.length > 0) {
           data.messages.forEach(msg => {
             lastMsgIndex++;
-            if (msg.type === 'CONNECTION_STATUS') {
-              statusEl.textContent = msg.payload.electronConnected ? 'TV Connected' : 'TV Disconnected';
-              statusEl.classList.toggle('disconnected', !msg.payload.electronConnected);
-            }
             if (msg.type === 'TV_INFO') status.textContent = msg.payload.appName + ' / ' + msg.payload.screen;
           });
         }
+        // Immediate re-poll for long-polling responsiveness
+        poll();
       } catch (e) {
         console.error('Poll error:', e);
+        setTimeout(poll, 2000); // Wait bit longer on error
       }
-      setTimeout(poll, 1000);
     }
 
     poll();
@@ -228,8 +147,6 @@ app.get('/', (_req, res) => {
   res.send(getMobileUI()); 
 });
 
-app.get('/health', (_req, res) => res.json({ status: 'ok', electron: electronWs?.readyState === WebSocket.OPEN }));
-
 app.post('/api/command', (req, res) => {
   const { clientId, type, payload } = req.body;
   if (!clientId || !type) {
@@ -240,33 +157,71 @@ app.post('/api/command', (req, res) => {
   res.json({ success: true });
 });
 
-app.get('/api/poll', (req, res) => {
-  const clientId = req.query.clientId as string;
+app.get('/api/poll', async (req, res) => {
+  const clientId = (req.query.clientId as string) || 'television';
   const index = parseInt(req.query.index as string || '0', 10);
   
-  if (!clientId) {
-    res.status(400).json({ error: 'Missing clientId' });
-    return;
-  }
-
   clientLastPoll.set(clientId, Date.now());
 
-  const messages = messageQueue.slice(index);
-  const electronConnected = electronWs?.readyState === WebSocket.OPEN;
-  
-  res.json({ messages, electronConnected });
+  // Function to get current response data
+  const getResponseData = () => {
+    const messages = messageQueue.slice(index);
+    const lastTVPoll = clientLastPoll.get('television') || 0;
+    const electronConnected = (Date.now() - lastTVPoll) < TV_POLL_TIMEOUT_MS;
+    return { messages, electronConnected };
+  };
+
+  // If we have messages, return immediately
+  let data = getResponseData();
+  if (data.messages.length > 0) {
+    return res.json(data);
+  }
+
+  // Otherwise, wait for a new message or timeout
+  const onNewMessage = () => {
+    // Clear timeout and listeners when we get a message
+    clearTimeout(timeoutHandle);
+    messageEmitter.off('new_message', onNewMessage);
+    res.json(getResponseData());
+  };
+
+  const timeoutHandle = setTimeout(() => {
+    messageEmitter.off('new_message', onNewMessage);
+    res.json(getResponseData());
+  }, LONG_POLL_TIMEOUT_MS);
+
+  messageEmitter.once('new_message', onNewMessage);
 });
 
 app.get('/api/status', (_req, res) => {
+  const lastTVPoll = clientLastPoll.get('television') || 0;
   res.json({ 
-    electronConnected: electronWs?.readyState === WebSocket.OPEN,
+    electronConnected: (Date.now() - lastTVPoll) < TV_POLL_TIMEOUT_MS,
     clientCount: clientLastPoll.size
   });
 });
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[Server] Running on http://localhost:${PORT}`);
-  connectToElectron();
+  console.log(`[Server] Mode: Optimized Long-Polling (Near-Instant Response)`);
+  
+  // Announce service for mDNS discovery
+  bonjour.publish({ name: 'TV-OS-Server', type: 'http', port: PORT });
+  console.log(`[Server] mDNS Service 'TV-OS-Server' published on port ${PORT}`);
 });
 
-process.on('SIGTERM', () => { electronWs?.close(); server.close(); process.exit(0); });
+process.on('SIGTERM', () => { 
+  bonjour.unpublishAll(() => {
+    bonjour.destroy();
+    server.close(); 
+    process.exit(0); 
+  });
+});
+
+process.on('SIGINT', () => {
+  bonjour.unpublishAll(() => {
+    bonjour.destroy();
+    server.close();
+    process.exit(0);
+  });
+});

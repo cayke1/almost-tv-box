@@ -146,6 +146,11 @@ export interface ElectronAPI {
   
   // Network
   getLocalIP: () => Promise<string>;
+  getInterfaces: () => Promise<Array<{ name: string; address: string }>>;
+  
+  // Settings
+  loadSettings: () => Promise<any>;
+  saveSettings: (settings: any) => Promise<boolean>;
   
   // Mouse simulation
   moveMouse: (dx: number, dy: number) => Promise<void>;

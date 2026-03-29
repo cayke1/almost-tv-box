@@ -8,6 +8,10 @@ const electronAPI = {
   closeAppView: () => ipcRenderer.invoke('app:close-view'),
   
   getLocalIP: () => ipcRenderer.invoke('network:get-local-ip'),
+  getInterfaces: () => ipcRenderer.invoke('network:get-interfaces'),
+  
+  loadSettings: () => ipcRenderer.invoke('settings:load'),
+  saveSettings: (settings: any) => ipcRenderer.invoke('settings:save', settings),
   
   moveMouse: (dx: number, dy: number) => ipcRenderer.invoke('mouse:move', dx, dy),
   clickMouse: (button: 'left' | 'right') => ipcRenderer.invoke('mouse:click', button),

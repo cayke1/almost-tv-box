@@ -20,7 +20,7 @@ function AppContent() {
       setShowKeyboard(false);
       setKeyboardInput('');
     }
-  }, [appState.isOpen]);
+  }, [appState.isOpen, showKeyboard]);
 
   useEffect(() => {
     const handleTextInput = (text: string) => {
@@ -58,6 +58,7 @@ function AppContent() {
         }
       }
     };
+    
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [appState.isOpen, closeApp]);
@@ -118,7 +119,7 @@ function AppContent() {
         ))}
       </main>
 
-      <footer className="mt-12 text-gray-500 text-sm">
+      <footer className="mt-12 text-gray-500 text-sm flex flex-col items-center gap-2">
         <p>Use arrow keys to navigate • Press Enter to select • Press Escape to go back</p>
       </footer>
 
