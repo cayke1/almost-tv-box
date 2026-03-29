@@ -112,11 +112,24 @@ function startLocalServer() {
     mobileClients.add(ws);
 
     ws.on('message', (data) => {
-      const msg = JSON.parse(data.toString());
-      handleMobileMessage(ws, msg);
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'PING') {
+          ws.send(JSON.stringify({ type: 'PONG', payload: {} }));
+          return;
+        }
+        handleMobileMessage(ws, msg);
+      } catch (e) {}
     });
 
-    ws.on('close', () => mobileClients.delete(ws));
+    ws.on('close', () => {
+      mobileClients.delete(ws);
+      console.log('[Desktop] Mobile client disconnected');
+    });
+  });
+
+  localWss.on('error', (error) => {
+    console.error('[Desktop] Local server error:', error.message);
   });
 
   console.log(`[Desktop] Local WebSocket server on port ${LOCAL_WS_PORT}`);
@@ -143,37 +156,88 @@ function handleMobileMessage(ws: WebSocket, msg: { type: string; payload: Record
   broadcastToServer({ type: msg.type, payload: msg.payload });
 }
 
+let serverReconnectAttempts = 0;
+let serverReconnectTimeout: NodeJS.Timeout | null = null;
+let serverPingInterval: NodeJS.Timeout | null = null;
+const maxServerReconnectAttempts = 10;
+
+function getServerReconnectDelay(): number {
+  return Math.min(1000 * Math.pow(2, serverReconnectAttempts), 30000);
+}
+
 function connectToServer() {
+  if (serverReconnectTimeout) {
+    clearTimeout(serverReconnectTimeout);
+    serverReconnectTimeout = null;
+  }
+
+  if (serverReconnectAttempts >= maxServerReconnectAttempts) {
+    console.log('[Desktop] Max server reconnect attempts reached');
+    return;
+  }
+
   const serverUrl = `ws://${SERVER_HOST}:${SERVER_PORT}`;
-  console.log(`[Desktop] Connecting to server: ${serverUrl}`);
+  console.log(`[Desktop] Connecting to server: ${serverUrl} (attempt ${serverReconnectAttempts + 1})`);
 
-  serverWs = new WebSocket(serverUrl);
+  try {
+    serverWs = new WebSocket(serverUrl);
 
-  serverWs.on('open', () => {
-    console.log('[Desktop] Connected to server');
-    broadcastToServer({ type: 'CONNECTION_STATUS', payload: { electronConnected: true } });
-  });
+    serverWs.on('open', () => {
+      console.log('[Desktop] Connected to server');
+      serverReconnectAttempts = 0;
+      broadcastToServer({ type: 'CONNECTION_STATUS', payload: { electronConnected: true } });
+      startServerPing();
+    });
 
-  serverWs.on('message', (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      for (const ws of mobileClients) {
-        if (ws.readyState === WebSocket.OPEN) ws.send(data.toString());
+    serverWs.on('message', (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'PONG') return;
+        for (const ws of mobileClients) {
+          if (ws.readyState === WebSocket.OPEN) ws.send(data.toString());
+        }
+      } catch (error) {
+        console.error('[Desktop] Failed to parse server message:', error);
       }
-    } catch (error) {
-      console.error('[Desktop] Failed to parse server message:', error);
+    });
+
+    serverWs.on('close', () => {
+      console.log('[Desktop] Disconnected from server');
+      stopServerPing();
+      broadcastToServer({ type: 'CONNECTION_STATUS', payload: { electronConnected: false } });
+      
+      if (serverReconnectAttempts < maxServerReconnectAttempts) {
+        const delay = getServerReconnectDelay();
+        console.log(`[Desktop] Reconnecting in ${delay}ms...`);
+        serverReconnectTimeout = setTimeout(() => {
+          serverReconnectAttempts++;
+          connectToServer();
+        }, delay);
+      }
+    });
+
+    serverWs.on('error', (error) => {
+      console.error('[Desktop] Server connection error:', error.message);
+    });
+  } catch (error) {
+    console.error('[Desktop] Failed to create WebSocket:', error);
+  }
+}
+
+function startServerPing(): void {
+  stopServerPing();
+  serverPingInterval = setInterval(() => {
+    if (serverWs && serverWs.readyState === WebSocket.OPEN) {
+      serverWs.send(JSON.stringify({ type: 'PING', payload: {} }));
     }
-  });
+  }, 15000);
+}
 
-  serverWs.on('close', () => {
-    console.log('[Desktop] Disconnected from server');
-    broadcastToServer({ type: 'CONNECTION_STATUS', payload: { electronConnected: false } });
-    setTimeout(connectToServer, 3000);
-  });
-
-  serverWs.on('error', (error) => {
-    console.error('[Desktop] Server connection error:', error.message);
-  });
+function stopServerPing(): void {
+  if (serverPingInterval) {
+    clearInterval(serverPingInterval);
+    serverPingInterval = null;
+  }
 }
 
 function broadcastToServer(msg: { type: string; payload: Record<string, unknown> }) {

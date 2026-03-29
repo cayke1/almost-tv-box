@@ -22,6 +22,12 @@ interface ClientMessage {
 }
 
 let electronWs: WebSocket | null = null;
+let reconnectAttempts = 0;
+let reconnectTimeout: NodeJS.Timeout | null = null;
+let pingInterval: NodeJS.Timeout | null = null;
+const maxReconnectAttempts = 10;
+const baseReconnectDelay = 1000;
+
 const mobileClients: Map<string, MobileClient> = new Map();
 
 const app = express();
@@ -31,35 +37,100 @@ app.use(express.json());
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
+function getReconnectDelay(): number {
+  const delay = Math.min(baseReconnectDelay * Math.pow(2, reconnectAttempts), 30000);
+  return delay;
+}
+
 function connectToElectron(): void {
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+
+  if (reconnectAttempts >= maxReconnectAttempts) {
+    console.log('[Server] Max reconnect attempts reached, stopping...');
+    return;
+  }
+
   const wsUrl = `ws://${ELECTRON_HOST}:${ELECTRON_WS_PORT}`;
-  console.log(`[Server] Connecting to Electron at ${wsUrl}`);
+  console.log(`[Server] Connecting to Electron at ${wsUrl} (attempt ${reconnectAttempts + 1})`);
 
-  electronWs = new WebSocket(wsUrl);
+  try {
+    electronWs = new WebSocket(wsUrl);
 
-  electronWs.on('open', () => {
-    console.log('[Server] Connected to Electron');
-    broadcastToMobile({ type: 'CONNECTION_STATUS', payload: { electronConnected: true } });
-  });
+    electronWs.on('open', () => {
+      console.log('[Server] Connected to Electron');
+      reconnectAttempts = 0;
+      broadcastToMobile({ type: 'CONNECTION_STATUS', payload: { electronConnected: true } });
+      startPing();
+    });
 
-  electronWs.on('message', (data: Buffer) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      broadcastToMobile(msg);
-    } catch (error) {
-      console.error('[Server] Failed to parse message:', error);
+    electronWs.on('message', (data: Buffer) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'PONG') {
+          return;
+        }
+        broadcastToMobile(msg);
+      } catch (error) {
+        console.error('[Server] Failed to parse message:', error);
+      }
+    });
+
+    electronWs.on('close', () => {
+      console.log('[Server] Disconnected from Electron');
+      stopPing();
+      broadcastToMobile({ type: 'CONNECTION_STATUS', payload: { electronConnected: false } });
+      
+      if (reconnectAttempts < maxReconnectAttempts) {
+        const delay = getReconnectDelay();
+        console.log(`[Server] Reconnecting in ${delay}ms...`);
+        reconnectTimeout = setTimeout(() => {
+          reconnectAttempts++;
+          connectToElectron();
+        }, delay);
+      }
+    });
+
+    electronWs.on('error', (error) => {
+      console.error('[Server] Electron connection error:', error.message);
+    });
+  } catch (error) {
+    console.error('[Server] Failed to create WebSocket:', error);
+  }
+}
+
+function startPing(): void {
+  stopPing();
+  pingInterval = setInterval(() => {
+    if (electronWs && electronWs.readyState === WebSocket.OPEN) {
+      electronWs.send(JSON.stringify({ type: 'PING', payload: {} }));
     }
-  });
+  }, 15000);
+}
 
-  electronWs.on('close', () => {
-    console.log('[Server] Disconnected from Electron');
-    broadcastToMobile({ type: 'CONNECTION_STATUS', payload: { electronConnected: false } });
-    setTimeout(connectToElectron, 3000);
-  });
+function stopPing(): void {
+  if (pingInterval) {
+    clearInterval(pingInterval);
+    pingInterval = null;
+  }
+}
 
-  electronWs.on('error', (error) => {
-    console.error('[Server] Electron connection error:', error.message);
-  });
+function startMobilePing(): void {
+  setInterval(() => {
+    const now = Date.now();
+    for (const [clientId, client] of mobileClients) {
+      if (now - client.lastActivity > 60000) {
+        client.ws.close();
+        mobileClients.delete(clientId);
+        continue;
+      }
+      if (client.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(JSON.stringify({ type: 'PING', payload: {} }));
+      }
+    }
+  }, 30000);
 }
 
 function broadcastToMobile(msg: unknown): void {
@@ -165,11 +236,16 @@ wss.on('connection', (ws: WebSocket) => {
 
   console.log(`[Server] Client connected: ${clientId}`);
   ws.send(JSON.stringify({ type: 'TV_INFO', payload: { appName: 'TV-OS', screen: 'home' } }));
-  broadcastToMobile({ type: 'CONNECTION_STATUS', payload: { clientCount: mobileClients.size } });
+  ws.send(JSON.stringify({ type: 'CONNECTION_STATUS', payload: { electronConnected: electronWs?.readyState === WebSocket.OPEN, clientCount: mobileClients.size } }));
 
   ws.on('message', (data: Buffer) => {
     try {
-      handleMobileMessage(clientId, JSON.parse(data.toString()));
+      const msg = JSON.parse(data.toString());
+      if (msg.type === 'PING') {
+        ws.send(JSON.stringify({ type: 'PONG', payload: {} }));
+        return;
+      }
+      handleMobileMessage(clientId, msg);
     } catch (error) {
       console.error('[Server] Invalid message:', error);
     }
@@ -187,6 +263,7 @@ app.get('/health', (_req, res) => res.json({ status: 'ok', electron: electronWs?
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[Server] Running on http://localhost:${PORT}`);
   connectToElectron();
+  startMobilePing();
 });
 
 process.on('SIGTERM', () => { electronWs?.close(); server.close(); process.exit(0); });
