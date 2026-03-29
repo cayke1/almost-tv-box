@@ -1,6 +1,7 @@
 import { ipcMain, app } from 'electron';
 import os from 'os';
 import { AppManager } from './app-manager';
+import { getSettingsManager } from './settings-manager';
 
 let appManager: AppManager | null = null;
 
@@ -44,6 +45,29 @@ export function setupIpcHandlers(mainWindow: Electron.BrowserWindow) {
 
   ipcMain.handle('mouse:click', async (_event, button: 'left' | 'right') => {
     mainWindow.webContents.send('mouse:click', { button });
+  });
+
+  ipcMain.handle('network:get-interfaces', () => {
+    const interfaces = os.networkInterfaces();
+    const results: Array<{ name: string; address: string }> = [];
+    for (const name of Object.keys(interfaces)) {
+      for (const iface of interfaces[name]!) {
+        if (iface.family === 'IPv4' && !iface.internal) {
+          results.push({ name, address: iface.address });
+        }
+      }
+    }
+    return results;
+  });
+
+  ipcMain.handle('settings:load', () => {
+    return getSettingsManager().getSettings();
+  });
+
+  ipcMain.handle('settings:save', (_event, settings: any) => {
+    getSettingsManager().save(settings);
+    ipcMain.emit('settings:updated');
+    return true;
   });
 
   return appManager;

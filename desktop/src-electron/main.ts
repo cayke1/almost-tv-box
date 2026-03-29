@@ -1,9 +1,10 @@
-import { app, BrowserWindow, ipcMain, screen, globalShortcut, session } from 'electron';
+import { app, BrowserWindow, ipcMain, screen } from 'electron';
 import path from 'path';
 import fs from 'fs';
-import { WebSocketServer } from 'ws';
 import * as http from 'http';
 import { setupIpcHandlers, getAppManager } from './services/ipc-handlers';
+import { getSettingsManager } from './services/settings-manager';
+import { MobileControllerServer } from './services/websocket-server';
 
 app.commandLine.appendSwitch('disable-features', 'CrossSiteDocumentBlockingIfIsolating');
 app.commandLine.appendSwitch('disable-web-security');
@@ -11,29 +12,18 @@ app.commandLine.appendSwitch('allow-file-access-from-files');
 app.commandLine.appendSwitch('allow-universal-access-from-file');
 
 let mainWindow: BrowserWindow | null = null;
+let mobileServer: MobileControllerServer | null = null;
+let isPolling = false;
 
 const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
-
-const SERVER_HOST = process.env.SERVER_HOST || '127.0.0.1';
-const SERVER_PORT = parseInt(process.env.SERVER_PORT || '8080', 10);
-const LOCAL_WS_PORT = parseInt(process.env.LOCAL_WS_PORT || '8081', 10);
 const DATA_PATH = process.env.DATA_PATH || path.join(app.getPath('userData'), 'data');
 
-function setupSession() {
-  if (!fs.existsSync(DATA_PATH)) {
-    fs.mkdirSync(DATA_PATH, { recursive: true });
-  }
-  session.setPartitionPersistPath(DATA_PATH);
-  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    callback(true);
-  });
-  console.log('[Desktop] Session data path:', DATA_PATH);
+function getSettings() {
+  return getSettingsManager().getSettings();
 }
 
-let serverPollInterval: NodeJS.Timeout | null = null;
-let lastMessageIndex = 0;
-let localWss: WebSocketServer | null = null;
-const mobileClients: Set<WebSocket> = new Set();
+function getServerHost() { return getSettings().serverHost; }
+function getServerPort() { return getSettings().serverPort; }
 
 function createWindow() {
   const { width, height } = screen.getPrimaryDisplay().workAreaSize;
@@ -101,64 +91,35 @@ function createWindow() {
   });
 
   setupIpcHandlers(mainWindow);
+  connectToServer();
 
-  if (VITE_DEV_SERVER_URL) {
-    startLocalServer();
-    connectToServer();
-  }
+  // Start internal mobile controller server
+  mobileServer = new MobileControllerServer(mainWindow, (msg) => {
+    handleServerMessage(msg);
+  }, 8080);
+  mobileServer.start().catch(err => console.error('[Main] Failed to start mobile server:', err));
 
   mainWindow.webContents.on('did-finish-load', () => {
     const localIP = getLocalIP();
-    mainWindow?.webContents.send('server:ready', { ip: localIP, port: LOCAL_WS_PORT });
+    mainWindow?.webContents.send('server:ready', { ip: localIP, port: 0 });
     broadcastToServer({ type: 'TV_INFO', payload: { appName: 'TV-OS', screen: 'home' } });
   });
 }
 
-function startLocalServer() {
-  localWss = new WebSocketServer({ port: LOCAL_WS_PORT, host: '0.0.0.0' });
-
-  localWss.on('connection', (ws) => {
-    console.log('[Desktop] Mobile client connected (local)');
-    mobileClients.add(ws);
-
-    ws.on('message', (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === 'PING') {
-          ws.send(JSON.stringify({ type: 'PONG', payload: {} }));
-          return;
-        }
-        handleMobileMessage(ws, msg);
-      } catch (e) {}
-    });
-
-    ws.on('close', () => {
-      mobileClients.delete(ws);
-      console.log('[Desktop] Mobile client disconnected');
-    });
-  });
-
-  localWss.on('error', (error) => {
-    console.error('[Desktop] Local server error:', error.message);
-  });
-
-  console.log(`[Desktop] Local WebSocket server on port ${LOCAL_WS_PORT}`);
-}
-
-function handleMobileMessage(ws: WebSocket, msg: { type: string; payload: Record<string, unknown> }) {
+function handleServerMessage(msg: { type: string; payload: Record<string, unknown> }) {
   if (!mainWindow) return;
 
   const appManager = getAppManager();
   const activeViewId = appManager?.getActiveViewId();
   const hasActiveView = activeViewId !== null && activeViewId !== undefined;
 
-  console.log(`[Desktop] handleMobileMessage: type=${msg.type}, activeViewId=${activeViewId}, hasActiveView=${hasActiveView}`);
+  console.log(`[Desktop] handleServerMessage: type=${msg.type}, activeViewId=${activeViewId}`);
 
   switch (msg.type) {
     case 'NAVIGATION': {
       const direction = msg.payload.direction as string;
       if (hasActiveView) {
-        const keyMap: Record<string, string> = { up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight' };
+        const keyMap: Record<string, string> = { up: 'Up', down: 'Down', left: 'Left', right: 'Right' };
         if (keyMap[direction]) {
           appManager?.sendKeyToActiveView(keyMap[direction], 'keyDownUp');
         }
@@ -177,9 +138,39 @@ function handleMobileMessage(ws: WebSocket, msg: { type: string; payload: Record
     }
     case 'BACK': {
       if (hasActiveView) {
+        console.log('[Desktop] BACK received, sending Escape to active view...');
         appManager?.sendKeyToActiveView('Escape', 'keyDownUp');
       } else {
         mainWindow.webContents.send('back');
+      }
+      break;
+    }
+    case 'HOME': {
+      console.log('[Desktop] HOME received, closing all views...');
+      appManager?.closeAllViews();
+      break;
+    }
+    case 'VOLUME_UP': {
+      if (hasActiveView) {
+        appManager?.sendKeyToActiveView('VolumeUp', 'keyDownUp');
+      } else {
+        mainWindow.webContents.send('volume-up');
+      }
+      break;
+    }
+    case 'VOLUME_DOWN': {
+      if (hasActiveView) {
+        appManager?.sendKeyToActiveView('VolumeDown', 'keyDownUp');
+      } else {
+        mainWindow.webContents.send('volume-down');
+      }
+      break;
+    }
+    case 'VOLUME_MUTE': {
+      if (hasActiveView) {
+        appManager?.sendKeyToActiveView('VolumeMute', 'keyDownUp');
+      } else {
+        mainWindow.webContents.send('volume-mute');
       }
       break;
     }
@@ -197,25 +188,16 @@ function handleMobileMessage(ws: WebSocket, msg: { type: string; payload: Record
     case 'SCROLL':
     case 'MOUSE_MOVE':
     case 'MOUSE_CLICK': {
-      if (hasActiveView) {
-        // Touch events go to active BrowserView if supported
-      } else {
+      if (!hasActiveView) {
         mainWindow.webContents.send('touch-event', msg);
       }
       break;
     }
   }
-
-  broadcastToServer({ type: msg.type, payload: msg.payload });
 }
 
-let serverReconnectAttempts = 0;
-let serverReconnectTimeout: NodeJS.Timeout | null = null;
+let lastMessageIndex = 0;
 let serverConnected = false;
-
-function getServerReconnectDelay(): number {
-  return Math.min(1000 * Math.pow(2, serverReconnectAttempts), 30000);
-}
 
 function httpRequest(options: http.RequestOptions): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -223,6 +205,11 @@ function httpRequest(options: http.RequestOptions): Promise<string> {
       let data = '';
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => resolve(data));
+    });
+    // Set a long timeout for long-polling
+    req.setTimeout(45000, () => {
+      req.destroy();
+      reject(new Error('Request Timeout'));
     });
     req.on('error', reject);
     req.end();
@@ -233,8 +220,8 @@ async function sendToServer(msg: { type: string; payload: Record<string, unknown
   try {
     const postData = JSON.stringify(msg);
     await httpRequest({
-      hostname: SERVER_HOST,
-      port: SERVER_PORT,
+      hostname: getServerHost(),
+      port: getServerPort(),
       path: '/api/command',
       method: 'POST',
       headers: {
@@ -243,16 +230,18 @@ async function sendToServer(msg: { type: string; payload: Record<string, unknown
       },
     });
   } catch (error) {
-    console.error('[Desktop] Failed to send to server:', error);
+    console.error('[Desktop] Failed to send to server:', error.message);
   }
 }
 
 async function pollServer(): Promise<void> {
+  if (!isPolling) return;
+
   try {
     const data = await httpRequest({
-      hostname: SERVER_HOST,
-      port: SERVER_PORT,
-      path: `/api/poll?index=${lastMessageIndex}`,
+      hostname: getServerHost(),
+      port: getServerPort(),
+      path: `/api/poll?clientId=television&index=${lastMessageIndex}`,
       method: 'GET',
     });
 
@@ -262,54 +251,33 @@ async function pollServer(): Promise<void> {
     if (response.messages && Array.isArray(response.messages)) {
       for (const msg of response.messages) {
         lastMessageIndex++;
-        console.log('[Desktop] Server message:', msg.type);
-        
-        for (const ws of mobileClients) {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(msg));
-          }
-        }
+        console.log('[Desktop] Processing polled message:', msg.type);
+        handleServerMessage(msg);
       }
     }
+    // Immediate re-poll on success
+    setImmediate(pollServer);
   } catch (error) {
-    console.error('[Desktop] Poll error:', error);
+    console.error('[Desktop] Poll error:', error.message);
     serverConnected = false;
+    // Wait bit longer on error before re-polling
+    setTimeout(pollServer, 2000);
   }
 }
 
 function startServerPolling(): void {
-  if (serverPollInterval) return;
-  
+  if (isPolling) return;
+  isPolling = true;
   pollServer();
-  serverPollInterval = setInterval(() => {
-    pollServer();
-  }, 1000);
 }
 
 function stopServerPolling(): void {
-  if (serverPollInterval) {
-    clearInterval(serverPollInterval);
-    serverPollInterval = null;
-  }
+  isPolling = false;
 }
 
 function connectToServer(): void {
-  if (serverReconnectTimeout) {
-    clearTimeout(serverReconnectTimeout);
-    serverReconnectTimeout = null;
-  }
-
-  if (serverReconnectAttempts >= 10) {
-    console.log('[Desktop] Max server reconnect attempts reached');
-    return;
-  }
-
-  console.log(`[Desktop] Connecting to server (HTTP polling): http://${SERVER_HOST}:${SERVER_PORT} (attempt ${serverReconnectAttempts + 1})`);
-
+  console.log(`[Desktop] Starting long-polling to backend: http://${getServerHost()}:${getServerPort()}`);
   startServerPolling();
-  
-  console.log('[Desktop] Connected to server (polling mode)');
-  serverReconnectAttempts = 0;
   broadcastToServer({ type: 'CONNECTION_STATUS', payload: { electronConnected: true } });
 }
 
@@ -318,14 +286,28 @@ function broadcastToServer(msg: { type: string; payload: Record<string, unknown>
 }
 
 function getLocalIP(): string {
+  const settings = getSettings();
   const { networkInterfaces } = require('os');
-  for (const name of Object.keys(networkInterfaces())) {
-    for (const net of networkInterfaces()[name]!) {
+  const interfaces = networkInterfaces();
+
+  if (settings.selectedInterface && interfaces[settings.selectedInterface]) {
+    const iface = interfaces[settings.selectedInterface].find((i: any) => i.family === 'IPv4' && !i.internal);
+    if (iface) return iface.address;
+  }
+
+  for (const name of Object.keys(interfaces)) {
+    for (const net of interfaces[name]!) {
       if (net.family === 'IPv4' && !net.internal) return net.address;
     }
   }
   return '127.0.0.1';
 }
+
+ipcMain.on('settings:updated', () => {
+  console.log('[Desktop] Settings updated, restarting connection...');
+  stopServerPolling();
+  connectToServer();
+});
 
 app.whenReady().then(() => {
   createWindow();
@@ -334,12 +316,11 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   stopServerPolling();
-  localWss?.close();
   if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('before-quit', () => {
   stopServerPolling();
-  localWss?.close();
+  if (mobileServer) mobileServer.stop();
   if (mainWindow) { mainWindow.removeAllListeners('close'); mainWindow.close(); }
 });
