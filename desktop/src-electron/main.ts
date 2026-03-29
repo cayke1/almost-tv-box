@@ -4,6 +4,11 @@ import fs from 'fs';
 import { WebSocket, WebSocketServer } from 'ws';
 import { setupIpcHandlers } from './services/ipc-handlers';
 
+app.commandLine.appendSwitch('disable-features', 'CrossSiteDocumentBlockingIfIsolating');
+app.commandLine.appendSwitch('disable-web-security');
+app.commandLine.appendSwitch('allow-file-access-from-files');
+app.commandLine.appendSwitch('allow-universal-access-from-file');
+
 let mainWindow: BrowserWindow | null = null;
 
 const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
@@ -18,6 +23,9 @@ function setupSession() {
     fs.mkdirSync(DATA_PATH, { recursive: true });
   }
   session.setPartitionPersistPath(DATA_PATH);
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+    callback(true);
+  });
   console.log('[Desktop] Session data path:', DATA_PATH);
 }
 

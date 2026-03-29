@@ -126,6 +126,10 @@ export class AppManager {
       },
     });
 
+    if (appConfig.userAgent) {
+      view.webContents.setUserAgent(appConfig.userAgent);
+    }
+
     view.setBounds({
       x: 0,
       y: 0,
@@ -157,11 +161,24 @@ export class AppManager {
       console.log(`[AppManager] ${appId} navigated to:`, url);
     });
 
-    view.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
-      console.error('[AppManager] Failed to load:', errorCode, errorDescription);
-      this.mainWindow.webContents.send('app:error', { 
-        message: errorDescription 
-      });
+    view.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+      console.error('[AppManager] Failed to load:', errorCode, errorDescription, validatedURL);
+      if (errorCode === -2) {
+        console.log('[AppManager] Retrying load...');
+        setTimeout(() => view.webContents.loadURL(appConfig.url), 1000);
+      } else {
+        this.mainWindow.webContents.send('app:error', { 
+          message: errorDescription 
+        });
+      }
+    });
+
+    view.webContents.on('crashed', () => {
+      console.error('[AppManager] BrowserView crashed');
+    });
+
+    view.webContents.on('render-process-gone', (_event, details) => {
+      console.error('[AppManager] Render process gone:', details.reason);
     });
 
     this.views.set(appId, { view, appId });

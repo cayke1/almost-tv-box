@@ -10,7 +10,8 @@ export interface AppConfig {
   url: string;
   color: string;
   category: 'streaming' | 'browser' | 'settings';
-  externalPath?: string; // Path to external .exe or app
+  externalPath?: string;
+  userAgent?: string;
 }
 
 // App Manager
