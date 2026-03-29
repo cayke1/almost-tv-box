@@ -1,0 +1,24 @@
+# Gradle files
+.gradle/
+build/
+
+# Android Studio / IntelliJ files
+.idea/
+*.iml
+.cxx/
+local.properties
+
+# Log files
+*.log
+
+# Android artifacts
+*.apk
+*.aar
+*.ap_
+*.dex
+
+# Generated files
+captures/
+.externalNativeBuild/
+.vks/
+sentry-debug-meta.properties

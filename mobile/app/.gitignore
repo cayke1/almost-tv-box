@@ -1,0 +1,6 @@
+# App module build files
+/build/
+*.apk
+*.ap_
+*.dex
+*.class
