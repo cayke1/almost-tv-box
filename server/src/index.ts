@@ -2,19 +2,13 @@ import dotenv from 'dotenv';
 import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
-import { WebSocketServer, WebSocket } from 'ws';
+import { WebSocket } from 'ws';
 
 dotenv.config();
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const ELECTRON_HOST = process.env.ELECTRON_HOST || '127.0.0.1';
 const ELECTRON_WS_PORT = parseInt(process.env.ELECTRON_WS_PORT || '8081', 10);
-
-interface MobileClient {
-  id: string;
-  ws: WebSocket;
-  lastActivity: number;
-}
 
 interface ClientMessage {
   type: string;
@@ -28,14 +22,14 @@ let pingInterval: NodeJS.Timeout | null = null;
 const maxReconnectAttempts = 10;
 const baseReconnectDelay = 1000;
 
-const mobileClients: Map<string, MobileClient> = new Map();
+const messageQueue: Array<{ type: string; payload: Record<string, unknown> }> = [];
+const clientLastPoll: Map<string, number> = new Map();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const server = createServer(app);
-const wss = new WebSocketServer({ server });
 
 function getReconnectDelay(): number {
   const delay = Math.min(baseReconnectDelay * Math.pow(2, reconnectAttempts), 30000);
@@ -117,41 +111,21 @@ function stopPing(): void {
   }
 }
 
-function startMobilePing(): void {
-  setInterval(() => {
-    const now = Date.now();
-    for (const [clientId, client] of mobileClients) {
-      if (now - client.lastActivity > 60000) {
-        client.ws.close();
-        mobileClients.delete(clientId);
-        continue;
-      }
-      if (client.ws.readyState === WebSocket.OPEN) {
-        client.ws.send(JSON.stringify({ type: 'PING', payload: {} }));
-      }
-    }
-  }, 30000);
-}
-
-function broadcastToMobile(msg: unknown): void {
-  const data = JSON.stringify(msg);
-  for (const client of mobileClients.values()) {
-    if (client.ws.readyState === WebSocket.OPEN) {
-      client.ws.send(data);
-    }
+function broadcastToMobile(msg: { type: string; payload: Record<string, unknown> }): void {
+  messageQueue.push(msg);
+  const maxQueueSize = 50;
+  while (messageQueue.length > maxQueueSize) {
+    messageQueue.shift();
   }
 }
 
 function handleMobileMessage(clientId: string, msg: ClientMessage): void {
-  const client = mobileClients.get(clientId);
-  if (!client) return;
-
-  client.lastActivity = Date.now();
+  clientLastPoll.set(clientId, Date.now());
 
   if (electronWs && electronWs.readyState === WebSocket.OPEN) {
     electronWs.send(JSON.stringify({ ...msg, clientId }));
   } else {
-    client.ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'TV not connected' } }));
+    messageQueue.push({ type: 'ERROR', payload: { message: 'TV not connected' } });
   }
 }
 
@@ -192,22 +166,41 @@ function getMobileUI(): string {
   </div>
   <div id="info">TV: <span id="tvInfo">-</span></div>
   <script>
-    const ws = new WebSocket('ws://' + location.host);
-    const status = document.getElementById('status');
-    const tvInfo = document.getElementById('tvInfo');
+    var clientIdCounterGlobal = 0;
+    const clientId = 'mobile_' + (++clientIdCounterGlobal);
+    const status = document.getElementById('tvInfo');
+    const statusEl = document.getElementById('status');
+    let lastMsgIndex = 0;
+    let electronConnected = false;
 
-    ws.onopen = () => { status.textContent = 'Connected'; };
-    ws.onclose = () => { status.textContent = 'Disconnected'; status.classList.add('disconnected'); };
-    ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'CONNECTION_STATUS') {
-        status.textContent = msg.payload.electronConnected ? 'TV Connected' : 'TV Disconnected';
-        status.classList.toggle('disconnected', !msg.payload.electronConnected);
+    async function poll() {
+      try {
+        const res = await fetch('/api/poll?clientId=' + clientId + '&index=' + lastMsgIndex);
+        const data = await res.json();
+        electronConnected = data.electronConnected;
+        if (data.messages) {
+          data.messages.forEach(msg => {
+            lastMsgIndex++;
+            if (msg.type === 'CONNECTION_STATUS') {
+              statusEl.textContent = msg.payload.electronConnected ? 'TV Connected' : 'TV Disconnected';
+              statusEl.classList.toggle('disconnected', !msg.payload.electronConnected);
+            }
+            if (msg.type === 'TV_INFO') status.textContent = msg.payload.appName + ' / ' + msg.payload.screen;
+          });
+        }
+      } catch (e) {
+        console.error('Poll error:', e);
       }
-      if (msg.type === 'TV_INFO') tvInfo.textContent = msg.payload.appName + ' / ' + msg.payload.screen;
-    };
+      setTimeout(poll, 1000);
+    }
 
-    const send = (type, payload = {}) => ws.send(JSON.stringify({ type, payload }));
+    poll();
+
+    const send = (type, payload = {}) => fetch('/api/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientId, type, payload })
+    });
 
     document.getElementById('up').onclick = () => send('NAVIGATION', { direction: 'up' });
     document.getElementById('down').onclick = () => send('NAVIGATION', { direction: 'down' });
@@ -230,40 +223,50 @@ function getMobileUI(): string {
 </html>`;
 }
 
-wss.on('connection', (ws: WebSocket) => {
-  const clientId = `mobile_${Date.now()}`;
-  mobileClients.set(clientId, { id: clientId, ws, lastActivity: Date.now() });
-
-  console.log(`[Server] Client connected: ${clientId}`);
-  ws.send(JSON.stringify({ type: 'TV_INFO', payload: { appName: 'TV-OS', screen: 'home' } }));
-  ws.send(JSON.stringify({ type: 'CONNECTION_STATUS', payload: { electronConnected: electronWs?.readyState === WebSocket.OPEN, clientCount: mobileClients.size } }));
-
-  ws.on('message', (data: Buffer) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      if (msg.type === 'PING') {
-        ws.send(JSON.stringify({ type: 'PONG', payload: {} }));
-        return;
-      }
-      handleMobileMessage(clientId, msg);
-    } catch (error) {
-      console.error('[Server] Invalid message:', error);
-    }
-  });
-
-  ws.on('close', () => {
-    mobileClients.delete(clientId);
-    broadcastToMobile({ type: 'CONNECTION_STATUS', payload: { clientCount: mobileClients.size } });
-  });
+app.get('/', (_req, res) => { 
+  res.setHeader('Content-Type', 'text/html'); 
+  res.send(getMobileUI()); 
 });
 
-app.get('/', (_req, res) => { res.setHeader('Content-Type', 'text/html'); res.send(getMobileUI()); });
 app.get('/health', (_req, res) => res.json({ status: 'ok', electron: electronWs?.readyState === WebSocket.OPEN }));
+
+app.post('/api/command', (req, res) => {
+  const { clientId, type, payload } = req.body;
+  if (!clientId || !type) {
+    res.status(400).json({ error: 'Missing clientId or type' });
+    return;
+  }
+  handleMobileMessage(clientId, { type, payload: payload || {} });
+  res.json({ success: true });
+});
+
+app.get('/api/poll', (req, res) => {
+  const clientId = req.query.clientId as string;
+  const index = parseInt(req.query.index as string || '0', 10);
+  
+  if (!clientId) {
+    res.status(400).json({ error: 'Missing clientId' });
+    return;
+  }
+
+  clientLastPoll.set(clientId, Date.now());
+
+  const messages = messageQueue.slice(index);
+  const electronConnected = electronWs?.readyState === WebSocket.OPEN;
+  
+  res.json({ messages, electronConnected });
+});
+
+app.get('/api/status', (_req, res) => {
+  res.json({ 
+    electronConnected: electronWs?.readyState === WebSocket.OPEN,
+    clientCount: clientLastPoll.size
+  });
+});
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[Server] Running on http://localhost:${PORT}`);
   connectToElectron();
-  startMobilePing();
 });
 
 process.on('SIGTERM', () => { electronWs?.close(); server.close(); process.exit(0); });

@@ -1,8 +1,20 @@
-import { BrowserView, screen, BrowserWindow, shell, app } from 'electron';
+import { BrowserView, screen, BrowserWindow, shell, app, Input } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import { exec } from 'child_process';
 import { appRegistry } from './app-registry';
+
+interface AppKeyMapping {
+  [key: string]: boolean;
+}
+
+const APPS_WITH_NATIVE_KEYBOARD: AppKeyMapping = {
+  youtube: true,
+};
+
+function needsNativeKeyboard(appId: string): boolean {
+  return APPS_WITH_NATIVE_KEYBOARD[appId] || false;
+}
 
 const STREMIO_PATHS = [
   'C:\\Program Files\\Stremio\\stremio.exe',
@@ -50,6 +62,85 @@ export class AppManager {
 
   constructor(mainWindow: BrowserWindow) {
     this.mainWindow = mainWindow;
+  }
+
+  sendKeyToActiveView(key: string, type: 'keyDown' | 'keyUp' | 'keyDownUp' = 'keyDown'): void {
+    const activeId = this.activeViewId;
+    console.log(`[AppManager] sendKeyToActiveView called, activeViewId: ${activeId}, type: ${type}`);
+
+    if (!activeId) {
+      console.log('[AppManager] No active view, skipping key send');
+      return;
+    }
+
+    const instance = this.views.get(activeId);
+    if (!instance) {
+      console.log('[AppManager] No instance found for:', activeId);
+      return;
+    }
+
+    console.log(`[AppManager] Sending key to ${activeId}: ${key}`);
+
+    const keyCodeMap: Record<string, number> = {
+      'ArrowUp': 38,
+      'ArrowDown': 40,
+      'ArrowLeft': 37,
+      'ArrowRight': 39,
+      'Enter': 13,
+      'Escape': 27,
+      ' ': 32,
+    };
+
+    const keyCode = keyCodeMap[key] || key.charCodeAt(0);
+    const jsCode = keyCodeMap[key] || 0;
+
+    const js = `
+      (function() {
+        const event = new KeyboardEvent('keydown', {
+          key: '${key}',
+          code: '${key}',
+          keyCode: ${jsCode},
+          which: ${jsCode},
+          bubbles: true,
+          cancelable: true
+        });
+        document.dispatchEvent(event);
+        
+        setTimeout(() => {
+          const eventUp = new KeyboardEvent('keyup', {
+            key: '${key}',
+            code: '${key}',
+            keyCode: ${jsCode},
+            which: ${jsCode},
+            bubbles: true,
+            cancelable: true
+          });
+          document.dispatchEvent(eventUp);
+        }, 50);
+      })();
+    `;
+
+    instance.view.webContents.executeJavaScript(js).catch(() => {});
+    
+    this.mainWindow.setBrowserView(instance.view);
+    instance.view.webContents.focus();
+  }
+
+  sendTextToActiveView(text: string): void {
+    const activeId = this.activeViewId;
+    if (!activeId) return;
+
+    const instance = this.views.get(activeId);
+    if (!instance) return;
+
+    console.log(`[AppManager] Sending text to ${activeId}: ${text}`);
+    
+    for (const char of text) {
+      instance.view.webContents.sendInputEvent({
+        type: 'keyDown',
+        keyCode: char,
+      });
+    }
   }
 
   async launchApp(appId: string): Promise<void> {
@@ -139,7 +230,8 @@ export class AppManager {
 
     view.setAutoResize({ width: true, height: true });
 
-    // Capture keyboard events from BrowserView
+    const useNativeKeyboard = needsNativeKeyboard(appId);
+
     view.webContents.on('before-input-event', (_event, input) => {
       if (input.type === 'keyDown' && input.key === 'Escape') {
         console.log('[AppManager] ESC pressed in BrowserView, closing...');
@@ -185,6 +277,7 @@ export class AppManager {
     this.activeViewId = appId;
 
     this.mainWindow.addBrowserView(view);
+    view.webContents.focus();
 
     try {
       await view.webContents.loadURL(appConfig.url);
@@ -239,6 +332,7 @@ export class AppManager {
     }
 
     this.mainWindow.addBrowserView(instance.view);
+    instance.view.webContents.focus();
     this.activeViewId = appId;
   }
 
