@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  tv-server:
+    build: .
+    container_name: tv-os-server
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - ELECTRON_HOST=${ELECTRON_HOST:-host.docker.internal}
+      - ELECTRON_WS_PORT=${ELECTRON_WS_PORT:-8081}
+    restart: unless-stopped
+    network_mode: host

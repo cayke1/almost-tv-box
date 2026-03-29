@@ -1,0 +1,229 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
+
+:root {
+  --bg-color: #0a0a0a;
+  --surface: #1a1a1a;
+  --primary: #3b82f6;
+  --text: #ffffff;
+  --text-muted: #888888;
+  --success: #22c55e;
+  --error: #ef4444;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg-color);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  padding: 20px;
+}
+
+.container {
+  width: 100%;
+  max-width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  background: var(--surface);
+  border-radius: 8px;
+}
+
+.status-indicator {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--error);
+  animation: pulse 2s infinite;
+}
+
+.status-indicator.connected {
+  background: var(--success);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.dpad {
+  display: grid;
+  grid-template-areas:
+    ". up ."
+    "left center right"
+    ". down .";
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 60px);
+  gap: 4px;
+}
+
+.dpad-btn {
+  background: var(--surface);
+  border: none;
+  border-radius: 8px;
+  color: var(--text);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.1s;
+}
+
+.dpad-btn:active {
+  background: var(--primary);
+  transform: scale(0.95);
+}
+
+.dpad-btn svg {
+  width: 24px;
+  height: 24px;
+  fill: currentColor;
+}
+
+.dpad-up { grid-area: up; }
+.dpad-down { grid-area: down; }
+.dpad-left { grid-area: left; }
+.dpad-right { grid-area: right; }
+
+.dpad-center {
+  grid-area: center;
+  background: var(--primary);
+  border: none;
+  border-radius: 50%;
+  color: var(--text);
+  font-weight: bold;
+  cursor: pointer;
+}
+
+.dpad-center:active {
+  transform: scale(0.9);
+}
+
+.action-btn {
+  padding: 16px;
+  background: var(--surface);
+  border: none;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.action-btn:active {
+  background: #2a2a2a;
+}
+
+.text-section {
+  display: flex;
+  gap: 8px;
+}
+
+.text-section input {
+  flex: 1;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid #333;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 16px;
+}
+
+.send-btn {
+  padding: 12px 20px;
+  background: var(--primary);
+  border: none;
+  border-radius: 8px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.touchpad {
+  height: 200px;
+  background: var(--surface);
+  border: 2px solid #333;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  touch-action: none;
+}
+
+.touchpad-hint {
+  color: var(--text-muted);
+  font-size: 14px;
+  pointer-events: none;
+}
+
+.touchpad.touched .touchpad-hint {
+  display: none;
+}
+
+.mouse-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+.mouse-btn {
+  flex: 1;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid #333;
+  border-radius: 8px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.mouse-btn:active {
+  background: #2a2a2a;
+}
+
+.sensitivity-control {
+  padding: 12px;
+  background: var(--surface);
+  border-radius: 8px;
+}
+
+.sensitivity-control label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.sensitivity-control input[type="range"] {
+  width: 100%;
+  height: 8px;
+  background: #333;
+  border-radius: 4px;
+  appearance: none;
+}
+
+.sensitivity-control input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  background: var(--primary);
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+@media (max-width: 320px) {
+  .dpad {
+    grid-template-rows: repeat(3, 50px);
+  }
+}
