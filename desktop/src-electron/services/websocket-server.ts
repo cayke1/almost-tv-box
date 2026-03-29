@@ -3,6 +3,9 @@ import { ipcMain, BrowserWindow } from 'electron';
 import * as http from 'http';
 import * as path from 'path';
 import * as fs from 'fs';
+import Bonjour from 'bonjour-service';
+
+const bonjour = new Bonjour();
 
 interface MobileClient {
   id: string;
@@ -33,9 +36,12 @@ export class MobileControllerServer {
   private mainWindow: BrowserWindow;
   private port: number = 8080;
   private pingInterval: NodeJS.Timeout | null = null;
+  private bonjourService: any = null;
+  private onMessage: (msg: ClientMessage) => void;
 
-  constructor(mainWindow: BrowserWindow, port: number = 8080) {
+  constructor(mainWindow: BrowserWindow, onMessage: (msg: ClientMessage) => void, port: number = 8080) {
     this.mainWindow = mainWindow;
+    this.onMessage = onMessage;
     this.port = port;
   }
 
@@ -64,21 +70,39 @@ export class MobileControllerServer {
       this.httpServer.listen(this.port, '0.0.0.0', () => {
         console.log(`[MobileControllerServer] Running on port ${this.port}`);
         this.startPingInterval();
+        
+        // Announce service for mDNS discovery
+        this.bonjourService = bonjour.publish({ name: 'TV-OS-Server', type: 'http', port: this.port });
+        console.log(`[MobileControllerServer] mDNS Service 'TV-OS-Server' published on port ${this.port}`);
+        
         resolve(this.port);
       });
     });
   }
 
   private handleHttpRequest(req: http.IncomingMessage, res: http.ServerResponse) {
-    if (req.url === '/' || req.url === '/mobile') {
+    const parsedUrl = new URL(req.url || '', `http://${req.headers.host || 'localhost'}`);
+    const pathname = parsedUrl.pathname;
+
+    if (pathname === '/' || pathname === '/mobile') {
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end(this.getMobileUI());
       return;
     }
 
-    if (req.url?.startsWith('/static/')) {
-      const filePath = req.url.slice(9);
+    if (pathname.startsWith('/static/')) {
+      const filePath = pathname.slice(9);
       this.serveStaticFile(filePath, res);
+      return;
+    }
+
+    if (pathname === '/api/command' && req.method === 'POST') {
+      this.handleApiCommand(req, res);
+      return;
+    }
+
+    if (pathname === '/api/status' && req.method === 'GET') {
+      this.handleApiStatus(req, res);
       return;
     }
 
@@ -92,6 +116,7 @@ export class MobileControllerServer {
       return;
     }
 
+    console.log(`[WebSocketServer] 404 Not Found: ${req.method} ${req.url}`);
     res.writeHead(404);
     res.end('Not Found');
   }
@@ -108,8 +133,14 @@ export class MobileControllerServer {
     const contentType = contentTypes[ext] || 'application/octet-stream';
     res.writeHead(200, { 'Content-Type': contentType });
     
-    const fileContent = fs.readFileSync(path.join(__dirname, '../../src/mobile', filePath));
-    res.end(fileContent);
+    // In production, files might be in a different relative path
+    try {
+      const fileContent = fs.readFileSync(path.join(__dirname, '../../src/mobile', filePath));
+      res.end(fileContent);
+    } catch (e) {
+      res.writeHead(404);
+      res.end('Not Found');
+    }
   }
 
   private handleConnection(ws: WebSocket) {
@@ -148,6 +179,39 @@ export class MobileControllerServer {
     });
   }
 
+  private handleApiCommand(req: http.IncomingMessage, res: http.ServerResponse) {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const message = JSON.parse(body) as ClientMessage;
+        this.processMessage('http-api', message);
+        res.writeHead(200, { 
+          'Content-Type': 'application/json', 
+          'Access-Control-Allow-Origin': '*' 
+        });
+        res.end(JSON.stringify({ success: true }));
+      } catch (error) {
+        res.writeHead(400, { 
+          'Content-Type': 'application/json', 
+          'Access-Control-Allow-Origin': '*' 
+        });
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
+    });
+  }
+
+  private handleApiStatus(req: http.IncomingMessage, res: http.ServerResponse) {
+    res.writeHead(200, { 
+      'Content-Type': 'application/json', 
+      'Access-Control-Allow-Origin': '*' 
+    });
+    res.end(JSON.stringify({
+      electronConnected: true,
+      clientCount: this.clients.size
+    }));
+  }
+
   private handleMessage(clientId: string, data: Buffer) {
     const client = this.clients.get(clientId);
     if (!client) return;
@@ -165,40 +229,11 @@ export class MobileControllerServer {
   private processMessage(clientId: string, message: ClientMessage) {
     console.log(`[WebSocketServer] Message from ${clientId}:`, message.type);
 
-    switch (message.type) {
-      case 'NAVIGATION':
-        this.mainWindow.webContents.send('navigate', message.payload.direction);
-        break;
-
-      case 'SELECT':
-        this.mainWindow.webContents.send('select');
-        break;
-
-      case 'BACK':
-        this.mainWindow.webContents.send('back');
-        break;
-
-      case 'TEXT_INPUT':
-        this.mainWindow.webContents.send('text-input', message.payload.text);
-        break;
-
-      case 'TOUCH_START':
-      case 'TOUCH_MOVE':
-      case 'TOUCH_END':
-      case 'SCROLL':
-      case 'MOUSE_MOVE':
-      case 'MOUSE_CLICK':
-        this.forwardToTouchpadHandler(message);
-        break;
-
-      case 'PING':
-        this.sendToClient(clientId, { type: 'PONG', payload: {} });
-        break;
+    if (message.type !== 'PING') {
+      this.onMessage(message);
+    } else {
+      this.sendToClient(clientId, { type: 'PONG', payload: {} });
     }
-  }
-
-  private forwardToTouchpadHandler(message: ClientMessage) {
-    this.mainWindow.webContents.send('touch-event', message);
   }
 
   private sendToClient(clientId: string, message: ServerMessage) {
@@ -249,6 +284,19 @@ export class MobileControllerServer {
     return `mobile_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   }
 
+  private getMobileUI(): string {
+    return `
+      <!DOCTYPE html>
+      <html>
+        <head><title>TV-OS Direct Controller</title></head>
+        <body>
+          <h1>Direct Controller (Fallback Mode)</h1>
+          <p>Please use the official Android App for the best experience.</p>
+        </body>
+      </html>
+    `;
+  }
+
   stop() {
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
@@ -259,15 +307,16 @@ export class MobileControllerServer {
     }
     this.clients.clear();
 
+    if (this.bonjourService) {
+      bonjour.unpublishAll(() => {
+        this.bonjourService = null;
+      });
+    }
+
     this.wss?.close();
     this.httpServer?.close();
   }
 
-  getPort(): number {
-    return this.port;
-  }
-
-  getClientCount(): number {
-    return this.clients.size;
-  }
+  getPort(): number { return this.port; }
+  getClientCount(): number { return this.clients.size; }
 }
